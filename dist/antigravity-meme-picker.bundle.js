@@ -749,51 +749,149 @@
         return img;
     }
 
-    function replaceInlineMemesInElement(el, memeMap) {
-        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+    const EXCLUDED_SELECTOR = 'code, pre, textarea, input, script, style, noscript, [contenteditable="true"], [data-lexical-editor="true"], .monaco-editor, .cm-editor, #ag-meme-picker';
+    const BLOCK_CONTAINER_SELECTOR = '.whitespace-pre-wrap, p, li, blockquote, td, dd';
+
+    function collectEligibleTextNodes(container) {
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
         const textNodes = [];
         let node;
         while ((node = walker.nextNode())) {
-            if (node.parentElement && node.parentElement.closest('code, pre, [data-lexical-editor="true"], #ag-meme-picker')) {
+            if (!node.nodeValue) continue;
+            if (node.parentElement && node.parentElement.closest(EXCLUDED_SELECTOR)) {
                 continue;
             }
-            if (node.nodeValue && node.nodeValue.includes('[表情:')) {
-                textNodes.push(node);
+            textNodes.push(node);
+        }
+        return textNodes;
+    }
+
+    function replaceMemesAcrossTextNodes(textNodes, memeMap) {
+        if (!textNodes.length) return false;
+
+        let fullText = '';
+        const segments = [];
+        for (const node of textNodes) {
+            const start = fullText.length;
+            const val = node.nodeValue || '';
+            fullText += val;
+            segments.push({ node, start, end: fullText.length });
+        }
+
+        if (!fullText.includes('[表情:')) return false;
+
+        const tagRegex = /\[表情:\s*([^\]]+)\]/g;
+        const matches = [];
+        let match;
+        while ((match = tagRegex.exec(fullText)) !== null) {
+            const name = match[1].trim();
+            const src = memeMap[name];
+            if (!src) continue;
+            matches.push({
+                start: match.index,
+                end: match.index + match[0].length,
+                name,
+                src
+            });
+        }
+
+        if (!matches.length) return false;
+
+        const findSegmentIndex = (offset, isEnd) => {
+            for (let i = 0; i < segments.length; i++) {
+                const seg = segments[i];
+                if (isEnd ? (offset > seg.start && offset <= seg.end) : (offset >= seg.start && offset < seg.end)) {
+                    return i;
+                }
+            }
+            return -1;
+        };
+
+        let replacedAny = false;
+        // Process from right to left so earlier character offsets remain valid
+        for (let mIdx = matches.length - 1; mIdx >= 0; mIdx--) {
+            const m = matches[mIdx];
+            const startSegIdx = findSegmentIndex(m.start, false);
+            const endSegIdx = findSegmentIndex(m.end, true);
+            if (startSegIdx === -1 || endSegIdx === -1) continue;
+
+            const startSeg = segments[startSegIdx];
+            const endSeg = segments[endSegIdx];
+            const startOffset = m.start - startSeg.start;
+            const endOffset = m.end - endSeg.start;
+
+            const img = createStickerImg(m.src, m.name, 52, true);
+            img.dataset.agMemeImg = 'true';
+
+            if (startSegIdx === endSegIdx) {
+                const textNode = startSeg.node;
+                const val = textNode.nodeValue || '';
+                const before = val.slice(0, startOffset);
+                const after = val.slice(endOffset);
+                const parent = textNode.parentNode;
+                if (!parent) continue;
+
+                textNode.nodeValue = before;
+                if (after) {
+                    const afterNode = document.createTextNode(after);
+                    parent.insertBefore(afterNode, textNode.nextSibling);
+                    parent.insertBefore(img, afterNode);
+                } else {
+                    parent.insertBefore(img, textNode.nextSibling);
+                }
+                replacedAny = true;
+            } else {
+                // Cross-node match (e.g. streaming markdown tokens split across sibling <span> or text nodes)
+                // Mutate nodeValue in-place rather than removing <span> elements so React's fiber tree stays intact
+                const startNode = startSeg.node;
+                const endNode = endSeg.node;
+                if (!startNode.parentNode) continue;
+
+                const startVal = startNode.nodeValue || '';
+                const endVal = endNode.nodeValue || '';
+                startNode.nodeValue = startVal.slice(0, startOffset);
+                for (let i = startSegIdx + 1; i < endSegIdx; i++) {
+                    segments[i].node.nodeValue = '';
+                }
+                endNode.nodeValue = endVal.slice(endOffset);
+                startNode.parentNode.insertBefore(img, startNode.nextSibling);
+                replacedAny = true;
             }
         }
 
+        return replacedAny;
+    }
+
+    function replaceInlineMemesInElement(el, memeMap) {
+        const walkRoot = el === document ? document.body : el;
+        if (!walkRoot) return false;
+
         let replacedAny = false;
-        const tagRegex = /\[表情:\s*([^\]]+)\]/g;
+        const handledNodes = new Set();
 
-        textNodes.forEach(textNode => {
-            const val = textNode.nodeValue;
-            tagRegex.lastIndex = 0;
-            let match;
-            let lastIdx = 0;
-            const frag = document.createDocumentFragment();
-            let nodeReplaced = false;
+        // 1. Handle block containers first so tags split across streaming <span> / text nodes match together
+        const blocks = collectMatchingElements(walkRoot, BLOCK_CONTAINER_SELECTOR);
+        blocks.forEach(block => {
+            if (block.closest(EXCLUDED_SELECTOR)) return;
+            const text = block.textContent || '';
+            if (!text.includes('[表情:')) return;
 
-            while ((match = tagRegex.exec(val)) !== null) {
-                const name = match[1].trim();
-                const src = memeMap[name];
-                if (!src) continue;
-
-                if (match.index > lastIdx) {
-                    frag.appendChild(document.createTextNode(val.slice(lastIdx, match.index)));
+            const blockTextNodes = collectEligibleTextNodes(block).filter(n => !handledNodes.has(n));
+            if (blockTextNodes.length) {
+                blockTextNodes.forEach(n => handledNodes.add(n));
+                if (replaceMemesAcrossTextNodes(blockTextNodes, memeMap)) {
+                    replacedAny = true;
                 }
-                frag.appendChild(createStickerImg(src, name, 52, true));
-                lastIdx = match.index + match[0].length;
-                nodeReplaced = true;
-                replacedAny = true;
             }
+        });
 
-            if (nodeReplaced) {
-                if (lastIdx < val.length) {
-                    frag.appendChild(document.createTextNode(val.slice(lastIdx)));
-                }
-                if (textNode.parentNode) {
-                    textNode.parentNode.replaceChild(frag, textNode);
-                }
+        // 2. Fallback for any remaining text nodes outside standard block tags
+        const remainingNodes = collectEligibleTextNodes(walkRoot).filter(
+            n => !handledNodes.has(n) && n.nodeValue.includes('[表情:')
+        );
+        remainingNodes.forEach(textNode => {
+            if (replaceMemesAcrossTextNodes([textNode], memeMap)) {
+                replacedAny = true;
             }
         });
 
@@ -823,13 +921,10 @@
             }
         });
 
-        const nodes = collectMatchingElements(
-            rootEl,
-            '.whitespace-pre-wrap, .prose p, .prose li, [class*="markdown"] p, [class*="markdown"] li'
-        );
-        nodes.forEach(el => {
-            if (el.dataset.agMemeRendered) return;
-            if (el.closest('code, pre, [data-lexical-editor="true"], #ag-meme-picker')) return;
+        // 1. Standalone pure-sticker bubbles (120px single / 96px multi)
+        const standaloneCandidates = collectMatchingElements(rootEl, '.whitespace-pre-wrap, p, li');
+        standaloneCandidates.forEach(el => {
+            if (el.closest(EXCLUDED_SELECTOR) || el.closest('button, nav')) return;
             const text = el.textContent || '';
             if (!text.includes('[表情:')) return;
 
@@ -839,7 +934,6 @@
                 const matches = [...text.matchAll(/\[表情:\s*([^\]]+)\]/g)];
                 const validNames = matches.map(m => m[1].trim()).filter(name => memeMap[name]);
                 if (validNames.length === matches.length && validNames.length > 0) {
-                    el.dataset.agMemeRendered = 'true';
                     const size = validNames.length === 1 ? 120 : 96;
                     const container = document.createElement('div');
                     container.className = 'ag-standalone-bubble-meme';
@@ -848,14 +942,12 @@
                         container.appendChild(createStickerImg(memeMap[name], name, size, false));
                     });
                     el.replaceChildren(container);
-                    return;
                 }
             }
-
-            if (replaceInlineMemesInElement(el, memeMap)) {
-                el.dataset.agMemeRendered = 'true';
-            }
         });
+
+        // 2. Inline mixed-text stickers across any chat/markdown container (selector-agnostic)
+        replaceInlineMemesInElement(rootEl, memeMap);
     }
 
     document.addEventListener('pointerdown', (e) => {
@@ -893,6 +985,15 @@
 
     const pendingNodes = new Set();
     let rafScheduled = false;
+    let settleTimer = null;
+
+    function queueScanTarget(node) {
+        if (!node) return;
+        const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+        if (!el || !el.isConnected) return;
+        const block = el.closest(BLOCK_CONTAINER_SELECTOR);
+        pendingNodes.add(block || el);
+    }
 
     function flushPendingMutations() {
         rafScheduled = false;
@@ -910,18 +1011,37 @@
     const obs = new MutationObserver((mutations) => {
         let hasWork = false;
         for (const m of mutations) {
+            if (m.type === 'characterData') {
+                queueScanTarget(m.target);
+                hasWork = true;
+                continue;
+            }
+            if (m.removedNodes && m.removedNodes.length > 0) {
+                queueScanTarget(m.target);
+                hasWork = true;
+            }
             for (const added of m.addedNodes) {
                 if (added.nodeType === Node.ELEMENT_NODE) {
-                    pendingNodes.add(added);
+                    queueScanTarget(added);
+                    hasWork = true;
+                } else if (added.nodeType === Node.TEXT_NODE) {
+                    queueScanTarget(m.target);
                     hasWork = true;
                 }
             }
         }
-        if (hasWork && !rafScheduled) {
-            rafScheduled = true;
-            requestAnimationFrame(flushPendingMutations);
+        if (hasWork) {
+            if (!rafScheduled) {
+                rafScheduled = true;
+                requestAnimationFrame(flushPendingMutations);
+            }
+            if (settleTimer) clearTimeout(settleTimer);
+            settleTimer = setTimeout(() => {
+                settleTimer = null;
+                renderChatMemes(document);
+            }, 300);
         }
     });
-    obs.observe(document.body, { childList: true, subtree: true });
+    obs.observe(document.body, { childList: true, subtree: true, characterData: true });
 })();
 
